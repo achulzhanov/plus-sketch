@@ -1,0 +1,6 @@
+This project incorporates code from llama2.c by Andrej Karpathy,
+used under the MIT license. See reference/llama2.c-LICENSE.
+
+Modified files under training/ are derived from that project.
+Original work in core/, platform/, and docs/ is © 2026 Alexander
+Chulzhanov under the MIT license (see LICENSE).

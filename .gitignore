@@ -1,0 +1,10 @@
+data/
+*.npz
+*.bin
+!models/*.bin
+__pycache__/
+.venv/
+out*/
+ckpt.pt
+.DS_Store
+training/samples
