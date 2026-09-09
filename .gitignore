@@ -1,10 +1,8 @@
+data
 data/
-*.npz
-*.bin
-!models/*.bin
+out*/
+training/*.png
+training/*.svg
 __pycache__/
 .venv/
-out*/
-ckpt.pt
-.DS_Store
-training/samples
+.DS_store
