@@ -6,3 +6,5 @@ training/*.svg
 __pycache__/
 .venv/
 .DS_store
+host
+*.o

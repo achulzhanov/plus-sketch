@@ -93,17 +93,20 @@ def read_psk(path):
         shapes.append(("output.weight", (vocab, dim)))
 
     for name, shape in shapes:
-        n = int(np.prod(shape))
+        rows, cols = shape
         if bits == 32:
-            sd[name] = r.arr("<f4", n).astype(np.float64).reshape(shape)
+            sd[name] = r.arr("<f4", rows * cols).astype(np.float64).reshape(shape)
             continue
-        n_groups = -(-n // group)
-        scales = r.arr("<i4", n_groups).astype(np.float64) / FX_ONE
+        gpr = -(-cols // group)
+        stride = gpr * group
+        n = rows * stride
+        scales = r.arr("<i4", rows * gpr).astype(np.float64) / FX_ONE
         if bits == 8:
             q = r.arr(np.int8, n).astype(np.float64)
         else:
             q = unpack_int4(r.take(-(-n // 2)), n)
-        sd[name] = (q * np.repeat(scales, group)[:n]).reshape(shape)
+        sd[name] = (q.reshape(rows, stride) *
+                    np.repeat(scales, group).reshape(rows, stride))[:, :cols]
 
     assert r.p == len(r.buf), f"{len(r.buf) - r.p} bytes unread -- format mismatch"
     print(f"  consumed all {r.p:,} bytes")

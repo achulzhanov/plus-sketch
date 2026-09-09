@@ -49,7 +49,7 @@ import numpy as np
 import torch
 
 MAGIC = b"PSK1"
-VERSION = 1
+VERSION = 2
 HEADER_BYTES = 128
 FX_ONE = 65536.0          # 16.16
 
@@ -62,19 +62,28 @@ def to_fx(x):
 
 def quantize(w, bits, group):
     """
-    Symmetric per-group. Returns (q int32 in range, scales float64).
-    Matches quantsweep.fake_quant so sweep results carry over exactly.
+    Symmetric per-group, grouped WITHIN each row.
+
+    Groups must not straddle matrix rows: the matmul walks one row at a time,
+    and with flat grouping w2 (64x172) has groups crossing row boundaries,
+    forcing the inner loop to track two unaligned group indices at once.
+
+    Each row is zero-padded to a multiple of `group`, giving the C side a
+    constant, group-aligned row stride. Costs 640 bytes on w2, nothing else.
+
+    Returns (q, scales, groups_per_row, stride).
     """
-    flat = w.reshape(-1).astype(np.float64)
-    pad = (-len(flat)) % group
-    if pad:
-        flat = np.concatenate([flat, np.zeros(pad)])
-    g = flat.reshape(-1, group)
+    rows, cols = w.shape
+    gpr = -(-cols // group)
+    stride = gpr * group
     qmax = 2 ** (bits - 1) - 1
-    scale = np.abs(g).max(axis=1) / qmax
-    scale[scale == 0] = 1.0
-    q = np.clip(np.round(g / scale[:, None]), -qmax - 1, qmax).astype(np.int32)
-    return q.reshape(-1)[: len(flat) - pad if pad else len(flat)], scale
+    padded = np.zeros((rows, stride), dtype=np.float64)
+    padded[:, :cols] = w
+    g = padded.reshape(rows * gpr, group)
+    s = np.abs(g).max(axis=1) / qmax
+    s[s == 0] = 1.0
+    q = np.clip(np.round(g / s[:, None]), -qmax - 1, qmax).astype(np.int32)
+    return q.reshape(-1), s, gpr, stride
 
 
 def pack_int4(q):
@@ -173,17 +182,18 @@ def main():
                 f.write(w.astype("<f4").tobytes())
                 total_q += w.size
                 continue
-            q, scale = quantize(w, a.bits, a.group)
+            q, scale, gpr, stride = quantize(w, a.bits, a.group)
             smin, smax = min(smin, scale.min()), max(smax, scale.max())
-            deq = (q.reshape(-1)[: w.size] *
-                   np.repeat(scale, a.group)[: w.size]).reshape(w.shape)
+            rows, cols = w.shape
+            deq = (q.reshape(rows, stride) *
+                   np.repeat(scale, a.group).reshape(rows, stride))[:, :cols]
             errs.append(np.abs(deq - w).mean() / np.abs(w).mean())
             f.write(to_fx(scale).astype("<i4").tobytes())
             if a.bits == 8:
                 f.write(np.clip(q, -128, 127).astype(np.int8).tobytes())
             else:
                 f.write(pack_int4(q))
-            total_q += w.size
+            total_q += q.size
 
     size = os.path.getsize(out_path)
     print(f"\nwrote {out_path}  {size/1024:.1f} KB")
