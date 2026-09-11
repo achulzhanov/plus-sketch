@@ -82,13 +82,22 @@ typedef struct {
 /* Returns 0 on success, negative on error. On failure *err points at a
  * static description. The model borrows into the loaded blob, so the blob
  * must outlive it -- psk_free() releases both. */
+/* Parse a model from a buffer. Takes ownership of `blob` -- psk_free()
+ * releases it. This is the real loader; the path-based one below is a
+ * convenience wrapper for hosts that have stdio. */
+int  psk_load_mem(psk_model *m, void *blob, long size, const char **err);
+
+#ifndef PSK_NO_STDIO
 int  psk_load(psk_model *m, const char *path, const char **err);
+#endif
 void psk_free(psk_model *m);
 
 /* Codebook lookup: writes the (dx, dy) offset for a stroke token.
  * Returns 0 if tok is not a stroke token. */
 int  psk_offset(const psk_model *m, int tok, int16_t *dx, int16_t *dy);
 
+#ifndef PSK_NO_STDIO
 void psk_print_config(const psk_model *m);
+#endif
 
 #endif /* PSK_H */

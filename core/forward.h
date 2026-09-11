@@ -33,6 +33,8 @@ typedef struct {
     fx_t *rope_c;   /* max_seq_len * (head_dim/2) */
     fx_t *rope_s;
 
+    int32_t *acc;   /* vocab_size -- matmul accumulator, see forward.c */
+
     fx_t inv_sqrt_hd;
 } psk_state;
 

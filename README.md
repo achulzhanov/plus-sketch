@@ -4,9 +4,28 @@ A 274K-parameter transformer that draws pictures, running on a **1986 Macintosh
 Plus**: Motorola 68000 at 7.83 MHz, 1 MB of RAM, no floating-point unit, and a
 512×342 one-bit display.
 
-You type `draw a cat`. Three minutes later, there's a cat.
+You type `draw a cat`. Two minutes later, there's a cat.
+
+**Measured: 1.89 s/token.** A house takes about 45 seconds, a cat a little over
+two minutes. No floating-point arithmetic anywhere in the inference path.
 
 ---
+
+## Run it
+
+`dist/PlusSketch.dsk` is an 800K floppy image with the application, the
+quantized model, and the category list on it.
+
+1. Get [Mini vMac](https://github.com/minivmac/minivmac) built for a Macintosh
+   Plus with 1 MB, plus a Plus ROM (`vMac.ROM`) and a System 6.0.8 boot image.
+2. Boot System 6 first, then **Control-O** `PlusSketch.dsk` to mount it
+   alongside. Mounting it first makes the Mac try to boot from it and fail.
+3. Run `PlusSketch`. Type a word, Return to draw. Left and right arrows change
+   temperature; backspace edits; escape clears.
+
+The disk is not bootable and has no SCSI driver partition, so it is for
+emulators and floppy transfer — **not BlueSCSI**. For real hardware, copy the
+three files onto an image made by Disk Jockey or a premade BlueSCSI image.
 
 ## Why this is possible at all
 
@@ -18,7 +37,7 @@ The obvious approaches don't fit. Estimated on a 68000 at ~5.9 MHz effective
 | diffusion (tiny U-Net, 32×32, 20 denoising steps) | ~3.2 hours |
 | autoregressive pixels, 64×64 | ~1.1 hours |
 | autoregressive pixels, full screen | ~48 hours |
-| **vector strokes (this project)** | **~3 minutes** |
+| **vector strokes (this project)** | **~2 minutes** |
 
 Diffusion dies because spatial dimensions multiply every layer's cost and you
 pay it 20–50 times per image. Pixel generation dies because 512×342 is 175,104
@@ -80,86 +99,33 @@ output matrices. Only `model.py`, `train.py`, `configurator.py` and `export.py`
 come from [llama2.c](https://github.com/karpathy/llama2.c). The tokenizer, the
 data loader, the export format, and the whole of `core/` are new.
 
-## Scripts
+## Performance
 
-Everything runs from inside `training/`. llama2.c uses flat imports and
-CWD-relative paths.
+Measured on Mini vMac emulating a Macintosh Plus at authentic 1× speed.
 
-| script | what it does | when to run it |
-|---|---|---|
-| `sketchdata.py` | the data pipeline — four subcommands, below | building a dataset |
-| `sketchtask.py` | dataset loader; replaces llama2.c's `tinystories.Task` | never directly, `train.py` imports it |
-| `train.py` | training loop, from llama2.c (one line changed: the `Task` import) | once there are `.bin` shards |
-| `sample.py` | draw from an fp32 checkpoint; renders PNG and SVG | evaluating a model, choosing temperature |
-| `quantsweep.py` | fake-quantizes in memory and draws, across bit widths and group sizes | **before** writing any C |
-| `export_fixed.py` | writes `.psk` files: int4, int8, or fp32 | once the model is good enough |
-| `verify_psk.py` | reads a `.psk` back, checks it, samples from it | after every export; also the spec for the C loader |
-| `dump_ref.py` | runs the quantized weights through PyTorch, dumps logits per position | to check the C against something |
+| | s/token | a house (22 tok) | a cat (60 tok) |
+|---|---|---|---|
+| first working build | 30.11 | 11 min | 30 min |
+| **after optimization** | **1.89** | **45 s** | **1.9 min** |
 
-### `sketchdata.py` subcommands
+**16× faster**, and almost all of it came from one line. See
+[porting notes](#porting-notes).
 
-- **`fetch`** — download Quick, Draw! sketch-rnn `.npz` files (~6 GB for all 345).
-- **`codebook`** — k-means over pen deltas, writes `models/codebook.npz`. Runs
-  once; the result is independent of length filters, so it never needs
-  rebuilding when re-tokenizing.
-- **`roundtrip`** — renders real drawings above their quantized versions.
-  **This is the gate.** The bottom row *is* the training data and it is the
-  model's ceiling; if it isn't recognizable, no amount of training will help.
-- **`tokenize`** — `.npz` → `.bin` shards. Cheap and disposable; re-run freely
-  to change `max_points` or `max_seq_len`.
+### Binary size
 
-### The C
-
-| file | what |
+| | |
 |---|---|
-| `core/fixed.h` | 16.16 arithmetic, plus exp/sin/cos from generated tables |
-| `core/tables.h` | 1.3 KB of lookup data; generated, don't edit |
-| `core/psk.c` | endian-safe `.psk` loader |
-| `core/forward.c` | the transformer — int8 activations × int4 weights |
-| `core/sketch.c` | tokens → strokes; QuickDraw drives this on the Mac |
-| `platform/host.c` | macOS driver: SVG output, reference comparison |
+| first build (RetroConsole + float `printf`) | 1,259,385 bytes |
+| **current** | **24,373 bytes** |
 
-`core/` links no libm, allocates nothing it doesn't free, and contains no
-floating point. It compiles identically on macOS and 68k, so outputs can be
-diffed between them.
-
-### Artifacts
-
-`models/plus_sketch_ckpt.pt` is the fp32 PyTorch checkpoint — the only thing
-that can be fine-tuned or re-exported from. The `.psk` files are what actually
-run. See `models/README.md`.
+A single `%f` in `printf` pulls in newlib's floating-point formatting, which on
+a machine with no FPU means SANE. That alone was most of the 1.2 MB.
 
 ## Quantization
 
 Weights are quantized to **4 bits, symmetric per-group scales, group size 64**.
-Scales are fixed point: 16.16 for weights, 8.24 for activations (see
-[porting notes](#porting-notes)). No floating-point arithmetic anywhere in the
-inference path.
-
-### int4 vs int8 on a Macintosh Plus
-
-| | int8 + `MULS.W` | **int4 + 16-entry LUT** |
-|---|---|---|
-| cycles per MAC | ~100 | **~34** |
-| seconds per token | 10.54 | **3.58** |
-| file size | 294.7 KB | **158.1 KB** |
-| apple / house (~45 tok) | 7.9 min | **2.7 min** |
-| cat (~55 tok) | 9.7 min | **3.3 min** |
-| bicycle (~75 tok) | 13.2 min | **4.5 min** |
-
-**2.9× faster**, and the whole difference is one instruction. `MULS.W` costs
-~70 of the ~100 cycles in an int8 multiply-accumulate. With 4-bit weights there
-are only 16 possible values, so you precompute `activation × w` for all 16 once
-per input column and the inner loop becomes unpack-nibble, index-table, add. No
-multiply at all, and it's exact — no additional accuracy loss.
-
-The 68000 has no scaled index addressing (that arrived with the 68020), so the
-lookup needs `ADD.W D0,D0` before `MOVE.W (A2,D0.W),D2`.
-
-Group size 64 rather than 32 or 16 for three reasons: scales cost 16 KB instead
-of 33 or 65; the accumulator is rescaled once per group, and rescaling sits in
-the hot loop that runs half a million times per token; and the visual difference
-between group sizes is within sampling noise.
+Scales are fixed point: 16.16 for weights, 8.24 for activations. No
+floating-point arithmetic anywhere in the inference path.
 
 ### Measured error
 
@@ -173,7 +139,8 @@ error is 7.63e-06, exactly the 16.16 rounding floor of 0.5/65536, which is a
 tidy confirmation that the fixed-point conversion does what it claims.
 
 **int8 is effectively lossless. int4 is a real ~12% perturbation, and the
-drawings survive it** at the temperature actually used.
+drawings survive it** at the temperature actually used. int8 would be ~2×
+slower for no visible gain.
 
 A trap worth naming: at temperature 0 the int4 output *looked better* than
 fp32, and the config that looked best had the **highest** error of the three.
@@ -203,8 +170,8 @@ Tensor order: `tok_embeddings`, then per layer `wq wk wv wo w1 w2 w3`, then
 `output` if the classifier isn't tied. Every weight row is padded to a multiple
 of `group`, so row *i* starts at element `i*stride` and its scales at `i*gpr`,
 both group-aligned. Without that padding, `w2` (64×172) would have groups
-straddling row boundaries and the matmul inner loop would need to track two
-unaligned group indices at once.
+straddling row boundaries and the matmul would need to track two unaligned
+group indices at once.
 
 **int4 packing:** two's-complement nibbles in [−8, 7]. Element 2i in the LOW
 nibble of byte i, element 2i+1 in the HIGH nibble. Odd tail zero-padded. The C
@@ -216,21 +183,173 @@ multi-byte field byte by byte.
 
 ## Macintosh Plus budget
 
-Booting with the app replacing the Finder leaves roughly 850 KB:
+Under System 6 without MultiFinder the application heap grows into all free
+RAM, which on a 1 MB Plus is roughly 850 KB.
 
 | | |
 |---|---|
 | `plus_sketch_q4.psk` (weights + scales + norms + codebook) | 158 KB |
-| KV cache (K and V as int32, 5 layers × 112 × 32) | 140 KB |
-| other runtime state (activations, RoPE tables, logits) | 14 KB |
-| code, framebuffer, scratch | ~120 KB |
-| **total** | **~432 KB** |
+| runtime state — KV cache 140 KB, activations, RoPE tables, logits | 157 KB |
+| application | 24 KB |
+| **total** | **~340 KB** |
 
-Almost a third of that is the KV cache, stored as int32 rather than int8 —
+Most of the runtime state is the KV cache, stored as int32 rather than int8 —
 worth 105 KB if it ever needs reclaiming, at the cost of extra quantization
 error. It isn't close to binding, so it stays simple.
 
 Memory was never the constraint. **int4 is a speed decision.**
+
+## Porting notes
+
+Four bugs in the fixed-point port produced no crash, no warning, and entirely
+plausible output. Each took a while to find.
+
+### `lo * (int32_t)xq[]` cost 665 cycles per MAC
+
+The matmul inner loop looked cheap — int4 weights against int8 activations —
+but `lo` was declared `int` and the activation was cast to `int32_t`, making it
+a **32×32 multiply**. The 68000 has no `MULS.L` until the 68020, so GCC emitted
+a `__mulsi3` helper call for every multiply-accumulate. Dividing the measured
+token time by the MAC count gave 665 cycles each, which is a subroutine call,
+not an instruction.
+
+The fix removes multiplication from the inner loop entirely. The loops are
+inverted so activations are outermost and output rows inner; for a fixed pair
+of activations there are only 16 possible int4 weight values, so two 16-entry
+tables hold every product that can occur — and they are built by repeated
+*addition* (`lot[k+1] = lot[k] + x0`), so even the table construction doesn't
+multiply. Each weight byte then costs two lookups and an add.
+
+Cost: the accumulator must live in memory rather than a register, and the
+weight walk is strided. Neither matters on a machine with no cache.
+
+**30.11 → 1.89 s/token.**
+
+The same mistake, in a smaller form, was in attention: `fx_mul` needs a 32×32→64
+product and so is also a helper call, ~14,000 times per token. Shifting both
+operands to 12.4 first lets a single `MULS.W` do it.
+
+### Activation scales need 8.24, not 16.16
+
+Activations are small — max |x| around 0.005 is normal — so an integer 16.16
+scale has two or three representable steps and throws away 20%+ of the scale.
+Weight scales are fine at 16.16 because weights are larger.
+
+The first attempt at the attention shift used 8.8 for the same reason and was
+wrong in the same way: attention weights at long context are around 1/60, which
+in 8.8 rounds to 2 or 3. 12.4 keeps 16× more.
+
+### The matmul must carry the scales through one int64 chain
+
+Combining the two scales first with `fx_mul` looks tidier and loses just as
+much: their product is often a handful of 16.16 units (0.04 × 0.001 → 2.6,
+stored as 2). Fixing this halved the logit error.
+
+### The sampler must scale by temperature before masking
+
+Masking category tokens to `INT32_MIN/2` and *then* multiplying by `1/T`
+overflows int32 for temperatures roughly between 0.25 and 0.4, wrapping the
+sentinel positive so every masked token becomes the argmax. The symptom was a
+Macintosh that appeared to hang at T=0.3 while 0.2 and 0.5 worked fine — it was
+generating category tokens, which produce no strokes, until the sequence limit.
+
+### RoPE frequencies need 8.24 as well
+
+The slowest rotation channels are around 0.0056, only 368 units of 16.16.
+Truncating there costs 0.1% on the frequency, which is then multiplied by the
+position — so by position 100 the sine is 3.5% low. Computing the frequency at
+8.24 brings that to 0.01%.
+
+### The gate that found all of them
+
+`training/dump_ref.py` runs the *quantized* weights through PyTorch and dumps
+logits at every position; `host.c` diffs the C against them.
+
+```bash
+python dump_ref.py --psk=../models/plus_sketch_q4.psk \
+    --out=../tests/ref_q4.bin --quant_acts
+make && ./host models/plus_sketch_q4.psk tests/ref_q4.bin
+```
+
+`--quant_acts` matters. Without it the reference keeps activations in float
+while the C quantizes them, and the C looks far worse than it is.
+
+Position 0 matches to 1e-4, which verifies embedding, RMSNorm, all 36 matmuls,
+int4 unpacking, group scales, SwiGLU and the output projection. Later positions
+drift by up to 0.5 on logits spanning ±12 — fixed-point accumulation through
+RoPE and the KV cache, well below what int4's 12% weight error contributes.
+
+Its blind spot is worth naming: the reference is 12 tokens long, so it never
+exercises long context. The 8.8 attention bug passed it cleanly and only showed
+up as a bad drawing at position 60.
+
+**Given the same seed, the Macintosh and the macOS build produce bit-identical
+drawings.** Same sampler, same arithmetic, opposite endianness. That is the
+strongest evidence the port is correct — not "looks similar", identical.
+
+## Scripts
+
+Everything under `training/` runs from inside that directory. llama2.c uses
+flat imports and CWD-relative paths.
+
+| script | what it does | when to run it |
+|---|---|---|
+| `sketchdata.py` | the data pipeline — four subcommands, below | building a dataset |
+| `sketchtask.py` | dataset loader; replaces llama2.c's `tinystories.Task` | never directly, `train.py` imports it |
+| `train.py` | training loop, from llama2.c (one line changed: the `Task` import) | once there are `.bin` shards |
+| `sample.py` | draw from an fp32 checkpoint; renders PNG and SVG | evaluating a model, choosing temperature |
+| `quantsweep.py` | fake-quantizes in memory and draws, across bit widths and group sizes | **before** writing any C |
+| `export_fixed.py` | writes `.psk` files: int4, int8, or fp32 | once the model is good enough |
+| `verify_psk.py` | reads a `.psk` back, checks it, samples from it | after every export; also the spec for the C loader |
+| `dump_ref.py` | runs the quantized weights through PyTorch, dumps logits per position | to check the C against something |
+| `scripts/make_disk.sh` | builds `dist/PlusSketch.dsk` from the current 68k build | after any 68k rebuild |
+
+### `sketchdata.py` subcommands
+
+- **`fetch`** — download Quick, Draw! sketch-rnn `.npz` files (~6 GB for all 345).
+- **`codebook`** — k-means over pen deltas, writes `models/codebook.npz`. Runs
+  once; the result is independent of length filters, so it never needs
+  rebuilding when re-tokenizing.
+- **`roundtrip`** — renders real drawings above their quantized versions.
+  **This is the gate.** The bottom row *is* the training data and it is the
+  model's ceiling; if it isn't recognizable, no amount of training will help.
+- **`tokenize`** — `.npz` → `.bin` shards. Cheap and disposable; re-run freely
+  to change `max_points` or `max_seq_len`.
+
+### The C
+
+| file | what |
+|---|---|
+| `core/fixed.h` | 16.16 arithmetic; `mul16` is the only cheap multiply on a 68000 |
+| `core/tables.h` | 1.3 KB of exp/sin lookup data; generated, don't edit |
+| `core/psk.c` | endian-safe `.psk` loader |
+| `core/forward.c` | the transformer — int8 activations × int4 weights, no multiply in the inner loop |
+| `core/sketch.c` | tokens → strokes, plus the degeneracy guard |
+| `platform/host.c` | macOS driver: SVG output, reference comparison |
+| `platform/mac68k.c` | Macintosh: QuickDraw UI, File Manager, typed prompt |
+| `mt.c` | prints the magnitude of each stage after one forward pass; finds which one collapsed |
+
+`core/` links no libm, allocates nothing it doesn't free, and contains no
+floating point. It compiles identically on macOS and 68k.
+
+### Building for the Mac
+
+The Retro68 Docker image avoids building a cross-compiler from source, which
+several people report fighting with on Apple Silicon.
+
+```bash
+docker run --rm -v $(pwd):/root ghcr.io/autc04/retro68 bash -c \
+ "cd /root && rm -rf build-68k && mkdir build-68k && cd build-68k && \
+  cmake .. -DCMAKE_TOOLCHAIN_FILE=/Retro68-build/toolchain/m68k-apple-macos/cmake/retro68.toolchain.cmake && \
+  make"
+./scripts/make_disk.sh
+```
+
+Two things that bit: RetroConsole is C++, so linking it needs
+`project(... CXX)` or the C++ runtime symbols go undefined — but it is not
+used any more, since QuickDraw from ROM is both smaller and closer to the
+final design. And the multiversal interfaces don't define the old `monaco`
+font constant; use the numeric font ID 4.
 
 ## Learning moments
 
@@ -260,11 +379,6 @@ specific points).
 every logit, which behaves like added sampling temperature, so the effective T
 is higher than the dialled value. Cat peaked at 0.3 in PyTorch and at 0.2 in
 the int4 C. Tune on the model that actually runs, not the one you trained.
-
-The default is **0.2**, exposed as a typed value on the Mac — which doubles as
-a way to show anyone using it what sampling temperature does. It costs nothing:
-the reciprocal is computed once, and the 732 `fx_mul` calls per token are under
-1% of the forward pass.
 
 **Greedy decoding fails visibly.** At temperature 0 the model produces a shape
 no human ever drew, identically every run. The mode of the distribution is not
@@ -298,44 +412,6 @@ individual kernel dispatches; at ~100 µs each that's the entire iteration time.
 Raising batch size to 256 does the same number of dispatches with more work
 each — but also does fewer optimizer updates per token, which matters, so 256
 rather than 512.
-
-## Porting notes
-
-Three bugs in the fixed-point port produced no crash, no warning, and entirely
-plausible output. Each took a while to find.
-
-**Activation scales need 8.24, not 16.16.** Activations are small — max |x|
-around 0.005 is normal — so an integer 16.16 scale has two or three
-representable steps and throws away 20%+ of the scale. Weight scales are fine
-at 16.16 because weights are larger.
-
-**The matmul must carry `ival × w_scale × x_scale` through one int64 chain.**
-Combining the two scales first with `fx_mul` looks tidier and loses just as
-much: their product is often a handful of 16.16 units (0.04 × 0.001 → 2.6,
-stored as 2). Fixing this halved the logit error.
-
-**The sampler must scale by temperature before masking.** Masking category
-tokens to `INT32_MIN/2` and *then* multiplying by `1/T` overflows int32 for
-temperatures roughly between 0.25 and 0.4, wrapping the sentinel positive so
-every masked token becomes the argmax. The symptom was blank drawings at
-T=0.3 while 0.2 and 0.5 worked fine.
-
-The gate that found all three: `training/dump_ref.py` runs the *quantized*
-weights through PyTorch and dumps logits at every position, and `host.c` diffs
-the C against them. Position 0 matches to 1e-4, which verifies embedding,
-RMSNorm, all 36 matmuls, int4 unpacking, group scales, SwiGLU and the output
-projection. Later positions drift by up to 0.5 on logits spanning ±12 —
-fixed-point accumulation through RoPE and the KV cache, well below what int4's
-12% weight error already contributes.
-
-```bash
-python dump_ref.py --psk=../models/plus_sketch_q4.psk \
-    --out=../tests/ref_q4.bin --quant_acts
-make && ./host models/plus_sketch_q4.psk tests/ref_q4.bin
-```
-
-`--quant_acts` matters. Without it the reference keeps activations in float
-while the C quantizes them, and the C looks far worse than it is.
 
 ## Train your own
 
@@ -381,8 +457,9 @@ hours on an M5 Max with a 40-core GPU.
 - Typing, never a menu. A menu implies stored clip art being traced; typing
   implies generation. Unknown words get `I DON'T KNOW HOW TO DRAW A ___.` —
   the honest decline is a feature.
-- Precompute `1/T` as 16.16 rather than dividing 732 logits per token. `DIVU`
-  is ~140 cycles on a 68000.
+- The drawing streams as it generates, via `sketch_generate`'s `on_point`
+  callback, with the bounding box rescaling as it grows. On a machine this slow
+  that is not a nicety.
 
 ## Hardware compatibility
 
@@ -392,9 +469,8 @@ won't run on a Plus.
 
 The 68020 added 32-bit addressing (the 68000 only wires 24 lines, capping it at
 16 MB), scaled index addressing, an instruction cache, and a much faster
-multiply (~28 cycles vs ~70). The 68030 adds an MMU and data cache. A **Mac
-SE/30** should manage roughly **1.4 s/token — a cat in about 78 seconds**
-against the Plus's 3.3 minutes.
+multiply. The 68030 adds an MMU and data cache. A **Mac SE/30** should manage
+roughly **0.7 s/token** against the Plus's 1.89.
 
 ## Roadmap
 
@@ -403,10 +479,14 @@ against the Plus's 3.3 minutes.
 - [x] Quantization validated in PyTorch (int4, group 64)
 - [x] `.psk` export and verification (int4, int8, fp32)
 - [x] `core/` — pure-integer C, no float anywhere, verified against PyTorch
-- [ ] Retro68 cross-compile, Mini vMac
-- [ ] QuickDraw rendering, keyboard input
+- [x] Retro68 cross-compile, Mini vMac
+- [x] QuickDraw rendering, typed prompt, temperature control
+- [x] 30.11 → 1.89 s/token
+- [ ] Degeneracy loops — most categories run to the sequence limit emitting a
+      repeating stroke. The guard in `sketch.c` catches short cycles but not
+      whatever `house` and `cake` fall into; a stroke-length cap may be the
+      better shape of fix
 - [ ] Real hardware
-- [ ] *(optional)* int4 LUT in 68000 assembly, worth ~3×
 
 ## Prior art
 

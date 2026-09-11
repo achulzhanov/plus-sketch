@@ -8,3 +8,7 @@ __pycache__/
 .DS_store
 host
 *.o
+build-68k/
+mt
+*.svg
+*.png

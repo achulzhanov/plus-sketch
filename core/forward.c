@@ -22,14 +22,6 @@ static fx_t *alloc_fx(long n)
     return (fx_t *)calloc((size_t)n, sizeof(fx_t));
 }
 
-/* Quantize a fx_t vector to int8, per group. Writes `stride` bytes
- * (n rounded up to a group multiple); the tail is zeroed.
- *
- * Scales are 8.24, NOT 16.16. Activations are often small -- max |x| around
- * 0.005 is common -- and an integer 16.16 scale would then have only two or
- * three representable steps, throwing away 20%+ of the scale. The extra 8
- * fractional bits are shifted back out in matmul().
- */
 static void quantize_vec(const fx_t *x, int n, int group,
                          int8_t *q, fx_t *s)
 {
@@ -63,51 +55,80 @@ static void quantize_vec(const fx_t *x, int n, int group,
     }
 }
 
-/* out[rows] = W * x, where x is already quantized. */
+/* out[rows] = W * x, where x is already quantized.
+ *
+ * The inner loop contains NO multiply. On a 68000 any 32x32 product is a
+ * __mulsi3 helper call -- measured at 665 cycles per MAC, which is where
+ * 31 s/token came from.
+ *
+ * Instead the loops are inverted: activations outermost, output rows inner.
+ * For a fixed pair of activations there are only 16 possible int4 weight
+ * values, so two 16-entry tables hold every product that can occur. They are
+ * built by repeated ADDITION (lot[k+1] = lot[k] + x0), so not even the table
+ * construction multiplies. Each weight byte then costs two lookups and an
+ * add.
+ *
+ * Cost: acc[] must live in memory rather than a register, and the weight
+ * walk is strided. Neither matters on a machine with no cache.
+ */
 static void matmul(fx_t *out, const int8_t *xq, const fx_t *xs,
-                   const psk_tensor *w, int group, int bits)
+                   const psk_tensor *w, int group, int bits, int32_t *acc)
 {
-    int i, g, j;
     int rows = w->rows, stride = w->stride, gpr = w->gpr;
+    int half = stride >> 1;
+    int i, g, j, k;
 
-    for (i = 0; i < rows; i++) {
-        const fx_t *ws = w->scales + (long)i * gpr;
-        fx_t total = 0;
+    for (i = 0; i < rows; i++) out[i] = 0;
 
-        for (g = 0; g < gpr; g++) {
-            int base = g * group;
-            int32_t ival = 0;
+    for (g = 0; g < gpr; g++) {
+        int base = g * group;
+        fx_t xsg = xs[g];
+        const fx_t *ws = w->scales + g;
 
-            if (bits == 8) {
-                const int8_t *wv = w->q + (long)i * stride + base;
-                for (j = 0; j < group; j++)
-                    ival += (int32_t)wv[j] * (int32_t)xq[base + j];
-            } else {
-                /* int4: two weights per byte, low nibble first */
-                const uint8_t *wb = (const uint8_t *)w->q
-                                  + (((long)i * stride + base) >> 1);
-                for (j = 0; j < group; j += 2) {
-                    uint8_t b = wb[j >> 1];
-                    int lo = b & 0x0F;  if (lo > 7) lo -= 16;
-                    int hi = b >> 4;    if (hi > 7) hi -= 16;
-                    ival += lo * (int32_t)xq[base + j]
-                          + hi * (int32_t)xq[base + j + 1];
+        for (i = 0; i < rows; i++) acc[i] = 0;
+
+        if (bits == 8) {
+            for (j = 0; j < group; j++) {
+                int16_t xv = (int16_t)xq[base + j];
+                const int8_t *wp = w->q + base + j;
+                for (i = 0; i < rows; i++) {
+                    acc[i] += mul16((int16_t)*wp, xv);
+                    wp += stride;
                 }
             }
+        } else {
+            int32_t lot[16], hit[16];
+            for (j = 0; j < group; j += 2) {
+                int32_t x0 = (int32_t)xq[base + j];
+                int32_t x1 = (int32_t)xq[base + j + 1];
+                const uint8_t *wp;
+                int32_t t;
 
-            /* sum(w*x) = ival * w_scale * x_scale, in 16.16.
-             *
-             * Do NOT precombine the scales with fx_mul: their product is
-             * often only a handful of 16.16 units (ws 0.04 * xs 0.001 ->
-             * 2.6, stored as 2), which throws away 20%+ of the scale. Carry
-             * full precision through a single 64-bit chain instead. This is
-             * one wide multiply per group of 64 MACs, so it stays out of the
-             * hot loop.
-             */
-            total += (fx_t)((((int64_t)ival * ws[g]) * (int64_t)xs[g])
-                            >> (FX_SHIFT + 8));
+                /* multiples of x0 and x1, built with adds only.
+                 * index 0..7 -> 0..+7, index 8..15 -> -8..-1 */
+                t = 0;
+                for (k = 0; k <= 7; k++) { lot[k] = t; t += x0; }
+                t = -t;
+                for (k = 8; k <= 15; k++) { lot[k] = t; t += x0; }
+                t = 0;
+                for (k = 0; k <= 7; k++) { hit[k] = t; t += x1; }
+                t = -t;
+                for (k = 8; k <= 15; k++) { hit[k] = t; t += x1; }
+
+                wp = (const uint8_t *)w->q + ((base + j) >> 1);
+                for (i = 0; i < rows; i++) {
+                    uint8_t b = *wp;
+                    acc[i] += lot[b & 15] + hit[b >> 4];
+                    wp += half;
+                }
+            }
         }
-        out[i] = total;
+
+        /* scales, once per (row, group): ival * w_scale * x_scale.
+         * ws is 16.16, xsg is 8.24, so the total shift is 24. */
+        for (i = 0; i < rows; i++)
+            out[i] += (fx_t)((((int64_t)acc[i] * ws[(long)i * gpr])
+                              * (int64_t)xsg) >> (FX_SHIFT + 8));
     }
 }
 
@@ -151,7 +172,7 @@ static void rmsnorm(fx_t *o, const fx_t *x, const fx_t *w, int n)
 
 static void softmax(fx_t *x, int n)
 {
-    fx_t maxv = x[0], sum = 0;
+    fx_t maxv = x[0], sum = 0, recip;
     int i;
 
     for (i = 1; i < n; i++)
@@ -161,8 +182,11 @@ static void softmax(fx_t *x, int n)
         sum += x[i];
     }
     if (sum <= 0) sum = 1;
+    /* One division, then multiplies -- fx_div is a 64-bit helper and this
+     * runs 20+ times per token. */
+    recip = fx_div(FX_ONE, sum);
     for (i = 0; i < n; i++)
-        x[i] = fx_div(x[i], sum);
+        x[i] = fx_mul(x[i], recip);
 }
 
 /* ---- state ------------------------------------------------------------ */
@@ -177,6 +201,7 @@ long psk_state_bytes(const psk_config *c)
     return (long)sizeof(fx_t) *
            (3 * dim + 2 * hid + dim + c->n_heads * seq + c->vocab_size
             + 2L * c->n_layers * seq * c->kv_dim + 2 * seq * hd2
+            + c->vocab_size
             + (xstride / g) + (hstride / g))
          + xstride + hstride;
 }
@@ -205,28 +230,25 @@ int psk_state_init(psk_state *s, const psk_config *c)
     s->vcache = alloc_fx((long)c->n_layers * seq * c->kv_dim);
     s->rope_c = alloc_fx(seq * hd2);
     s->rope_s = alloc_fx(seq * hd2);
+    s->acc    = (int32_t *)calloc((size_t)c->vocab_size, sizeof(int32_t));
     s->xq     = (int8_t *)calloc((size_t)xstride, 1);
     s->hq     = (int8_t *)calloc((size_t)hstride, 1);
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
         !s->att || !s->logits || !s->xs || !s->hs || !s->kcache ||
-        !s->vcache || !s->rope_c || !s->rope_s || !s->xq || !s->hq) {
+        !s->vcache || !s->rope_c || !s->rope_s || !s->xq || !s->hq ||
+        !s->acc) {
         psk_state_free(s);
         return -1;
     }
 
-    /* RoPE tables: freq_i = 10000^(-2i/head_dim), angle = pos * freq_i.
-     *
-     * freq is held at 8.24, not 16.16. At i=7, freq ~ 0.0056, which is only
-     * 368 units of 16.16 -- truncating that costs 0.1% on the angle, and at
-     * small angles sin(x) ~ x so the error lands straight on the output.
-     * The extra 8 bits fix it. */
+    /* RoPE tables: freq_i = 10000^(-2i/head_dim), angle = pos * freq_i */
     for (i = 0; i < hd2; i++) {
         fx_t e = fx_mul(FX_LN10000,
                         fx_div(FX_FROM_INT(2 * i), FX_FROM_INT(c->head_dim)));
-        int64_t freq24 = ((int64_t)fx_exp_neg(-e)) << 8;   /* 8.24 */
+        int64_t freq24 = fx_exp_neg24(-e);                 /* 8.24 */
         for (pos = 0; pos < seq; pos++) {
-            fx_t ang = (fx_t)(((int64_t)pos * freq24) >> 8);  /* back to 16.16 */
+            fx_t ang = (fx_t)(((int64_t)pos * freq24) >> 8);
             s->rope_c[pos * hd2 + i] = fx_cos(ang);
             s->rope_s[pos * hd2 + i] = fx_sin(ang);
         }
@@ -244,7 +266,7 @@ void psk_state_free(psk_state *s)
     free(s->xs); free(s->hs);
     free(s->kcache); free(s->vcache);
     free(s->rope_c); free(s->rope_s);
-    free(s->xq); free(s->hq);
+    free(s->xq); free(s->hq); free(s->acc);
     memset(s, 0, sizeof(*s));
 }
 
@@ -269,9 +291,9 @@ const fx_t *psk_forward(const psk_model *m, psk_state *s, int token, int pos)
         rmsnorm(s->xb, s->x, m->att_norm + (long)l * dim, dim);
         quantize_vec(s->xb, dim, group, s->xq, s->xs);
 
-        matmul(s->q, s->xq, s->xs, &m->wq[l], group, bits);
-        matmul(k,    s->xq, s->xs, &m->wk[l], group, bits);
-        matmul(v,    s->xq, s->xs, &m->wv[l], group, bits);
+        matmul(s->q, s->xq, s->xs, &m->wq[l], group, bits, s->acc);
+        matmul(k,    s->xq, s->xs, &m->wk[l], group, bits, s->acc);
+        matmul(v,    s->xq, s->xs, &m->wv[l], group, bits, s->acc);
 
         /* RoPE: rotate pairs of q (and k, up to kv_dim) */
         for (i = 0; i < dim; i += 2) {
@@ -298,8 +320,10 @@ const fx_t *psk_forward(const psk_model *m, psk_state *s, int token, int pos)
             for (t = 0; t <= pos; t++) {
                 const fx_t *kh = s->kcache + loff + (long)t * kv_dim + khoff;
                 fx_t score = 0;
+                /* 8.8 x 8.8 -> 16.16 in one MULS.W. fx_mul here would be a
+                 * 64-bit helper call, ~14k times per token. */
                 for (j = 0; j < hd; j++)
-                    score += fx_mul(qh[j], kh[j]);
+                    score += mul16(to_88(qh[j]), to_88(kh[j]));
                 att[t] = fx_mul(score, s->inv_sqrt_hd);
             }
             softmax(att, pos + 1);
@@ -307,34 +331,34 @@ const fx_t *psk_forward(const psk_model *m, psk_state *s, int token, int pos)
             for (j = 0; j < hd; j++) xbh[j] = 0;
             for (t = 0; t <= pos; t++) {
                 const fx_t *vh = s->vcache + loff + (long)t * kv_dim + khoff;
-                fx_t a = att[t];
+                int16_t a8 = to_88(att[t]);
                 for (j = 0; j < hd; j++)
-                    xbh[j] += fx_mul(a, vh[j]);
+                    xbh[j] += mul16(a8, to_88(vh[j]));
             }
         }
 
         quantize_vec(s->xb, dim, group, s->xq, s->xs);
-        matmul(s->xb2, s->xq, s->xs, &m->wo[l], group, bits);
+        matmul(s->xb2, s->xq, s->xs, &m->wo[l], group, bits, s->acc);
         for (i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
         /* feed-forward: w2( silu(w1(x)) * w3(x) ) */
         rmsnorm(s->xb, s->x, m->ffn_norm + (long)l * dim, dim);
         quantize_vec(s->xb, dim, group, s->xq, s->xs);
-        matmul(s->hb,  s->xq, s->xs, &m->w1[l], group, bits);
-        matmul(s->hb2, s->xq, s->xs, &m->w3[l], group, bits);
+        matmul(s->hb,  s->xq, s->xs, &m->w1[l], group, bits, s->acc);
+        matmul(s->hb2, s->xq, s->xs, &m->w3[l], group, bits, s->acc);
 
         for (i = 0; i < c->hidden_dim; i++)
             s->hb[i] = fx_mul(fx_mul(s->hb[i], fx_sigmoid(s->hb[i])),
                               s->hb2[i]);
 
         quantize_vec(s->hb, c->hidden_dim, group, s->hq, s->hs);
-        matmul(s->xb, s->hq, s->hs, &m->w2[l], group, bits);
+        matmul(s->xb, s->hq, s->hs, &m->w2[l], group, bits, s->acc);
         for (i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
     rmsnorm(s->x, s->x, m->final_norm, dim);
     quantize_vec(s->x, dim, group, s->xq, s->xs);
-    matmul(s->logits, s->xq, s->xs, &m->out, group, bits);
+    matmul(s->logits, s->xq, s->xs, &m->out, group, bits, s->acc);
     return s->logits;
 }
 
@@ -364,7 +388,8 @@ int psk_sample(const psk_model *m, fx_t *logits, fx_t inv_temp,
 
     /* Mask AFTER scaling. Masking first and then multiplying by inv_temp
      * overflows int32 for temperatures around 0.25-0.4, wrapping the
-     * sentinel positive so every category token becomes the argmax. */
+     * sentinel positive so every category token becomes the argmax --
+     * which produces no strokes and looks like a hang. */
     logits[TOK_BOS] = INT32_MIN / 2;
     if (pos > 0)
         for (i = c->cat_base; i < n; i++)
@@ -376,10 +401,18 @@ int psk_sample(const psk_model *m, fx_t *logits, fx_t inv_temp,
         return best;
     }
 
-    softmax(logits, n);
-
-    /* multinomial: walk the cumulative sum. No sort, so no top-p. */
-    r = (fx_t)(xorshift(rng_state) >> 16);     /* 0 .. 65535, i.e. [0,1) */
+    /* Unnormalized softmax: exponentiate, then draw against the sum
+     * directly. Avoids 732 fx_div calls -- one modulo instead. */
+    {
+        fx_t maxv = logits[0], sum = 0;
+        for (i = 1; i < n; i++) if (logits[i] > maxv) maxv = logits[i];
+        for (i = 0; i < n; i++) {
+            logits[i] = fx_exp_neg(logits[i] - maxv);
+            sum += logits[i];
+        }
+        if (sum <= 0) sum = 1;
+        r = (fx_t)(xorshift(rng_state) % (uint32_t)sum);
+    }
     cum = 0;
     for (i = 0; i < n; i++) {
         cum += logits[i];

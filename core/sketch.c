@@ -29,6 +29,7 @@ void sketch_generate(const psk_model *m, psk_state *s, sketch *sk,
     const psk_config *c = &m->cfg;
     int32_t x = 0, y = 0;
     int pos = 0, tok, new_stroke = 1;
+    int last_tok = -1, prev_tok = -1, run = 0;
 
     memset(sk, 0, sizeof(*sk));
     push(sk, 0, 0, 1, on_point, ctx);
@@ -48,6 +49,18 @@ void sketch_generate(const psk_model *m, psk_state *s, sketch *sk,
         sk->n_tokens++;
 
         if (tok == TOK_EOS) { sk->hit_eos = 1; break; }
+
+        /* Degeneracy guard. A single token repeating, or two alternating,
+         * is never a real drawing -- it is the model stuck in a cycle. The
+         * alternating case shows up as a dashed diagonal line, because it
+         * is an offset and a PEN_UP taking turns. */
+        if (tok == last_tok || tok == prev_tok) {
+            if (++run >= 8) break;
+        } else {
+            run = 0;
+        }
+        prev_tok = last_tok;
+        last_tok = tok;
 
         if (tok == TOK_PEN_UP) {
             new_stroke = 1;

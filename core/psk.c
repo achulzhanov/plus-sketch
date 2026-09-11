@@ -5,9 +5,11 @@
  * catches tensor-order mistakes loudly instead of loading garbage.
  */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef PSK_NO_STDIO
+#include <stdio.h>
+#endif
 
 #include "psk.h"
 
@@ -101,34 +103,21 @@ static int read_tensor(cursor *c, psk_tensor *t, const psk_config *cfg,
 
 /* ---------------------------------------------------------------------- */
 
-int psk_load(psk_model *m, const char *path, const char **err)
+int psk_load_mem(psk_model *m, void *blob_in, long size, const char **err)
 {
-    FILE *f;
-    long size;
-    uint8_t *blob, *p;
+    uint8_t *blob = (uint8_t *)blob_in, *p;
     cursor c;
     psk_config *cfg = &m->cfg;
     int32_t i, L;
 
     memset(m, 0, sizeof(*m));
     if (err) *err = NULL;
-
-    f = fopen(path, "rb");
-    if (!f) { if (err) *err = "cannot open file"; return -1; }
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size < PSK_HEADER) {
-        fclose(f); if (err) *err = "file too small"; return -1;
-    }
-    blob = (uint8_t *)malloc((size_t)size);
-    if (!blob) { fclose(f); if (err) *err = "out of memory"; return -1; }
-    if (fread(blob, 1, (size_t)size, f) != (size_t)size) {
-        free(blob); fclose(f); if (err) *err = "short read"; return -1;
-    }
-    fclose(f);
-
     m->blob = blob;
+
+    if (size < PSK_HEADER) {
+        if (err) *err = "file too small";
+        goto fail;
+    }
     c.base = blob; c.size = size; c.pos = 0; c.overflow = 0;
 
     p = take(&c, PSK_HEADER);
@@ -164,7 +153,6 @@ int psk_load(psk_model *m, const char *path, const char **err)
         goto fail;
     }
 
-    /* codebook */
     p = take(&c, (long)cfg->n_draw * 4);
     if (!p) goto trunc;
     m->draw_cb = fix_i16(p, cfg->n_draw * 2);
@@ -172,7 +160,6 @@ int psk_load(psk_model *m, const char *path, const char **err)
     if (!p) goto trunc;
     m->jump_cb = fix_i16(p, cfg->n_jump * 2);
 
-    /* norms: att, ffn interleaved per layer, then final */
     L = cfg->n_layers;
     {
         fx_t *att = (fx_t *)malloc(sizeof(fx_t) * L * cfg->dim);
@@ -199,7 +186,6 @@ int psk_load(psk_model *m, const char *path, const char **err)
     if (!p) goto trunc;
     m->final_norm = (const fx_t *)fix_i32(p, cfg->dim);
 
-    /* weights */
     m->wq = (psk_tensor *)calloc((size_t)L, sizeof(psk_tensor));
     m->wk = (psk_tensor *)calloc((size_t)L, sizeof(psk_tensor));
     m->wv = (psk_tensor *)calloc((size_t)L, sizeof(psk_tensor));
@@ -240,6 +226,31 @@ fail:
     return -1;
 }
 
+#ifndef PSK_NO_STDIO
+int psk_load(psk_model *m, const char *path, const char **err)
+{
+    FILE *f;
+    long size;
+    uint8_t *blob;
+
+    memset(m, 0, sizeof(*m));
+    if (err) *err = NULL;
+
+    f = fopen(path, "rb");
+    if (!f) { if (err) *err = "cannot open file"; return -1; }
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    blob = (uint8_t *)malloc((size_t)size);
+    if (!blob) { fclose(f); if (err) *err = "out of memory"; return -1; }
+    if (fread(blob, 1, (size_t)size, f) != (size_t)size) {
+        free(blob); fclose(f); if (err) *err = "short read"; return -1;
+    }
+    fclose(f);
+    return psk_load_mem(m, blob, size, err);
+}
+#endif
+
 void psk_free(psk_model *m)
 {
     if (!m) return;
@@ -267,6 +278,7 @@ int psk_offset(const psk_model *m, int tok, int16_t *dx, int16_t *dy)
     return 0;
 }
 
+#ifndef PSK_NO_STDIO
 void psk_print_config(const psk_model *m)
 {
     const psk_config *c = &m->cfg;
@@ -285,3 +297,4 @@ void psk_print_config(const psk_model *m)
            (long)c->jump_base, (long)(c->cat_base - 1),
            (long)c->cat_base, (long)(c->vocab_size - 1));
 }
+#endif /* PSK_NO_STDIO */

@@ -32,6 +32,29 @@ static inline int32_t fx_round(fx_t a)
     return (int32_t)((a + (a >= 0 ? FX_HALF : -FX_HALF)) >> FX_SHIFT);
 }
 
+/* 16x16 -> 32 multiply. This is the ONLY multiply that is cheap on a
+ * 68000: MULS.W, about 70 cycles. Anything wider becomes a __mulsi3 or
+ * __muldi3 helper call at several hundred cycles.
+ *
+ * Writing it with int16_t operands is what lets GCC's m68k backend match
+ * its mulhisi3 pattern. Passing plain ints -- even ints known to be small --
+ * gets you the helper. This cost the matmul 665 cycles per MAC before it
+ * was found.
+ */
+static inline int32_t mul16(int16_t a, int16_t b)
+{
+    return (int32_t)a * (int32_t)b;
+}
+
+/* Saturating convert 16.16 -> 8.8, for feeding mul16. */
+static inline int16_t to_88(fx_t v)
+{
+    v >>= 8;
+    if (v >  32767) return  32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
 /* Multiply. Needs a 64-bit intermediate: two 16.16 values multiplied give
  * a 32.32 result which must be shifted back down.
  *
@@ -117,15 +140,45 @@ static inline fx_t fx_exp_neg(fx_t x)
     ip = t >> FX_SHIFT;               /* floor, since >> rounds down */
     if (ip < -30) return 0;
     frac = t - (ip << FX_SHIFT);      /* in [0, 1) */
-    idx = (int32_t)(((int64_t)frac * (EXP2_N - 1)) >> FX_SHIFT);
-    if (idx >= EXP2_N - 1) idx = EXP2_N - 2;
+
+    /* EXP2_N is 65, so the table step is 65536/64 = 1024 = 2^10. That makes
+     * the interpolation shifts rather than a 64-bit multiply and divide --
+     * this function is called ~2800 times per token. */
+    idx = frac >> 10;
+    if (idx > EXP2_N - 2) idx = EXP2_N - 2;
     {
-        /* linear interpolation between table entries */
-        int32_t step = FX_ONE / (EXP2_N - 1);
         fx_t f0 = exp2_tab[idx], f1 = exp2_tab[idx + 1];
-        fx_t rem = frac - (fx_t)((int64_t)idx * step);
-        fx_t v = f0 + (fx_t)(((int64_t)(f1 - f0) * rem) / step);
-        return v >> (-ip);            /* 2^ip with ip negative */
+        int16_t d = (int16_t)(f1 - f0);          /* small, fits 16 bits */
+        int16_t r = (int16_t)(frac & 1023);
+        fx_t v = f0 + (mul16(d, r) >> 10);
+        return v >> (-ip);
+    }
+}
+
+/* Same as fx_exp_neg but returns 8.24.
+ *
+ * The final shift in fx_exp_neg is where small results lose their low bits:
+ * exp(-6.3) is about 0.0056, which is only 368 units of 16.16. RoPE's
+ * slowest frequency channels are exactly that size, and the error is then
+ * multiplied by the position -- so by position 100 the sine is 3.5% wrong.
+ * Keeping 8 more fractional bits fixes it. */
+static inline int64_t fx_exp_neg24(fx_t x)
+{
+    fx_t t, frac;
+    int32_t ip, idx;
+    if (x >= 0) return (int64_t)FX_ONE << 8;
+    t = fx_mul(x, FX_LOG2E);
+    ip = t >> FX_SHIFT;
+    if (ip < -30) return 0;
+    frac = t - (ip << FX_SHIFT);
+    idx = frac >> 10;
+    if (idx > EXP2_N - 2) idx = EXP2_N - 2;
+    {
+        fx_t f0 = exp2_tab[idx], f1 = exp2_tab[idx + 1];
+        int16_t d = (int16_t)(f1 - f0);
+        int16_t r = (int16_t)(frac & 1023);
+        fx_t v = f0 + (mul16(d, r) >> 10);
+        return (((int64_t)v) << 8) >> (-ip);
     }
 }
 
